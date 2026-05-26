@@ -32,7 +32,7 @@ private:
     void scanDirectory(const QString& path,
                        std::shared_ptr<FileSystemNode>& parentNode,
                        int currentDepth);
-    quint64 computeSizes(std::shared_ptr<FileSystemNode>& node);
+    quint64 computeSizes(const std::shared_ptr<FileSystemNode>& node);
 
     QString m_rootPath;
     int m_maxDepth;
@@ -41,8 +41,8 @@ private:
     qint64  m_folderCount = 0;
     qint64  m_bytesScanned = 0;
 
-    QMutex       m_mutex;
-    bool         m_cancelRequested = false;
+    QMutex        m_mutex;
+    bool          m_cancelRequested = false;
     QElapsedTimer m_progressTimer;
     static constexpr qint64 PROGRESS_INTERVAL_MS = 150;
 };
@@ -70,7 +70,6 @@ private slots:
 
 private:
     ScanWorker* m_worker = nullptr;
-    // Cached so consumers can safely call getScanResult() after the worker is gone
     std::shared_ptr<FileSystemNode> m_cachedResult;
     qint64 m_cachedFileCount   = 0;
     qint64 m_cachedFolderCount = 0;
