@@ -107,10 +107,10 @@ add_executable(DiskLens
     ${DIALOG_SOURCES}
 )
 
-if (MINGW)
-    target_link_options(DiskLens PRIVATE "-mwindows")
-    set_target_properties(DiskLens PROPERTIES QT_NO_ENTRYPOINT TRUE)
-endif()
+# if (MINGW)
+#     target_link_options(DiskLens PRIVATE "-mwindows")
+#     set_target_properties(DiskLens PROPERTIES QT_NO_ENTRYPOINT TRUE)
+# endif()
 
 target_link_libraries(DiskLens PRIVATE
     Qt${QT_VERSION_MAJOR}::Core
