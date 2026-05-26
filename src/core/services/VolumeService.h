@@ -12,6 +12,10 @@ public:
     ~VolumeService() = default;
 
     QVector<VolumeInfo> getMountedVolumes();
+    void refresh();
+
+signals:
+    void volumesChanged();
 };
 
 #endif // VOLUMESERVICE_H

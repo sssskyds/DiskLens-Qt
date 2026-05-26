@@ -4,6 +4,7 @@
 #include <QTextStream>
 #include <QDateTime>
 #include <QDir>
+#include <QFileInfo>
 
 // ─── ExportWorker ────────────────────────────────────────────────
 
@@ -20,19 +21,27 @@ void ExportWorker::cancel() {
     m_cancelRequested = true;
 }
 
+bool ExportWorker::isCancelled() {
+    QMutexLocker lock(&m_mutex);
+    return m_cancelRequested;
+}
+
 QString ExportWorker::formatBytes(qint64 bytes) {
-    if (bytes >= (qint64)1099511627776LL) return QString::number(bytes / 1099511627776.0, 'f', 2) + " TB";
-    if (bytes >= 1073741824LL) return QString::number(bytes / 1073741824.0, 'f', 2) + " GB";
-    if (bytes >= 1048576LL)    return QString::number(bytes / 1048576.0, 'f', 2) + " MB";
-    if (bytes >= 1024LL)       return QString::number(bytes / 1024.0, 'f', 1) + " KB";
+    if (bytes >= (qint64)1099511627776LL)
+        return QString::number(bytes / 1099511627776.0, 'f', 2) + " TB";
+    if (bytes >= 1073741824LL)
+        return QString::number(bytes / 1073741824.0, 'f', 2) + " GB";
+    if (bytes >= 1048576LL)
+        return QString::number(bytes / 1048576.0, 'f', 2) + " MB";
+    if (bytes >= 1024LL)
+        return QString::number(bytes / 1024.0, 'f', 1) + " KB";
     return QString::number(bytes) + " B";
 }
 
 void ExportWorker::run() {
     m_cancelRequested = false;
-    m_itemsWritten = 0;
+    m_itemsWritten    = 0;
 
-    // Use QSaveFile for atomic writes
     QSaveFile file(m_outputPath);
     if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
         emit exportFinished(false, m_outputPath);
@@ -56,7 +65,7 @@ void ExportWorker::run() {
             writeMarkdownSummary(out);
             break;
         case ExportOptions::CSV:
-            // CSV header
+            // Header row
             out << "Name,Path,Size (bytes),Size,Extension,Category";
             if (m_opts.includeModifiedDate) out << ",Modified";
             if (m_opts.includeCreatedDate)  out << ",Created";
@@ -66,6 +75,12 @@ void ExportWorker::run() {
             break;
     }
 
+    if (isCancelled()) {
+        // Discard the partial file — QSaveFile does not commit unless we call commit()
+        emit exportFinished(false, m_outputPath);
+        return;
+    }
+
     if (file.commit()) {
         emit exportFinished(true, m_outputPath);
     } else {
@@ -73,61 +88,58 @@ void ExportWorker::run() {
     }
 }
 
-void ExportWorker::exportTreeText(QTextStream& out, std::shared_ptr<FileSystemNode> node, int depth, const QString& prefix) {
-    {
-        QMutexLocker lock(&m_mutex);
-        if (m_cancelRequested) return;
-    }
+// ── Tree text export ──────────────────────────────────────────────
+// Fixed: previously wrote each node's name twice (once as the label line and
+// once again inside the child loop).  Now the root prints its own label and
+// recursively lets children do the same via exportTreeText.
+
+void ExportWorker::exportTreeText(QTextStream& out,
+                                  std::shared_ptr<FileSystemNode> node,
+                                  int depth,
+                                  const QString& prefix)
+{
+    if (isCancelled()) return;
     if (depth > m_opts.maxDepth) return;
 
-    QString line = prefix + node->getName();
-    if (node->isDirectory()) line += "/";
-    if (m_opts.includeSize && !node->isDirectory()) {
-        line += "  [" + formatBytes(node->getSize()) + "]";
-    }
-    out << line << "\n";
+    // Emit progress every 500 items
     m_itemsWritten++;
-
-    if (m_itemsWritten % 500 == 0) {
+    if (m_itemsWritten % 500 == 0)
         emit progressUpdated(m_itemsWritten, node->getName());
-    }
 
     if (node->isDirectory()) {
         const auto& children = node->getChildren();
-        for (int i = 0; i < children.size(); i++) {
-            bool isLast = (i == children.size() - 1);
-            QString childPrefix = prefix + (isLast ? "    " : "│   ");
-            QString connector = isLast ? "└── " : "├── ";
-            out << prefix << connector;
+        for (int i = 0; i < children.size(); ++i) {
+            if (isCancelled()) return;
+            const bool   isLast      = (i == children.size() - 1);
+            const QString connector  = isLast ? "└── " : "├── ";
+            const QString childPfx   = prefix + (isLast ? "    " : "│   ");
+            const auto&   child      = children[i];
 
-            // Write child content inline (without extra prefix for the name line)
-            auto& child = children[i];
-            QString childLine = child->getName();
-            if (child->isDirectory()) childLine += "/";
-            if (m_opts.includeSize && !child->isDirectory()) {
-                childLine += "  [" + formatBytes(child->getSize()) + "]";
-            }
-            out << childLine << "\n";
-            m_itemsWritten++;
+            QString label = child->getName();
+            if (child->isDirectory()) label += "/";
+            if (m_opts.includeSize && !child->isDirectory())
+                label += "  [" + formatBytes(child->getSize()) + "]";
 
-            if (child->isDirectory()) {
-                const auto& grandChildren = child->getChildren();
-                for (int j = 0; j < grandChildren.size(); j++) {
-                    exportTreeText(out, grandChildren[j], depth + 2, childPrefix);
-                }
-            }
+            out << prefix << connector << label << "\n";
+            exportTreeText(out, child, depth + 1, childPfx);
         }
     }
 }
 
+// ── Markdown export ───────────────────────────────────────────────
+
 void ExportWorker::writeMarkdownHeader(QTextStream& out) {
     out << "# DiskLens Export Report\n\n";
-    out << "**Generated**: " << QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss") << "\n\n";
+    out << "**Generated**: "
+        << QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss")
+        << "\n\n";
     out << "**Root Path**: `" << m_root->getPath() << "`\n\n";
     out << "**Total Size**: " << formatBytes(m_root->getSize()) << "\n\n";
     out << "---\n\n";
     out << "## Directory Structure\n\n";
     out << "```\n";
+    // Print root label
+    out << m_root->getName() << "/\n";
 }
 
 void ExportWorker::writeMarkdownSummary(QTextStream& out) {
@@ -136,113 +148,57 @@ void ExportWorker::writeMarkdownSummary(QTextStream& out) {
     out << "*Exported by DiskLens*\n";
 }
 
-void ExportWorker::exportMarkdown(QTextStream& out, std::shared_ptr<FileSystemNode> node, int depth) {
-    {
-        QMutexLocker lock(&m_mutex);
-        if (m_cancelRequested) return;
-    }
+void ExportWorker::exportMarkdown(QTextStream& out,
+                                  std::shared_ptr<FileSystemNode> node,
+                                  int depth)
+{
+    if (isCancelled()) return;
     if (depth > m_opts.maxDepth) return;
 
-    QString indent;
-    for (int i = 0; i < depth; i++) indent += "  ";
-
-    QString entry = indent;
-    if (node->isDirectory()) {
-        entry += "📁 " + node->getName() + "/";
-    } else {
-        entry += "📄 " + node->getName();
-        if (m_opts.includeSize) entry += " (" + formatBytes(node->getSize()) + ")";
-    }
-    out << entry << "\n";
-    m_itemsWritten++;
-
-    if (m_itemsWritten % 500 == 0) {
-        emit progressUpdated(m_itemsWritten, node->getName());
-    }
+    QString indent(depth * 2, ' ');
 
     if (node->isDirectory()) {
         for (auto& child : node->getChildren()) {
+            if (isCancelled()) return;
+            QString entry = indent;
+            if (child->isDirectory()) {
+                entry += "📁 " + child->getName() + "/";
+            } else {
+                entry += "📄 " + child->getName();
+                if (m_opts.includeSize)
+                    entry += " (" + formatBytes(child->getSize()) + ")";
+            }
+            out << entry << "\n";
+            m_itemsWritten++;
+            if (m_itemsWritten % 500 == 0)
+                emit progressUpdated(m_itemsWritten, child->getName());
             exportMarkdown(out, child, depth + 1);
         }
     }
 }
 
-void ExportWorker::exportCsv(QTextStream& out, std::shared_ptr<FileSystemNode> node, int depth) {
-    {
-        QMutexLocker lock(&m_mutex);
-        if (m_cancelRequested) return;
-    }
+// ── CSV export ────────────────────────────────────────────────────
+
+void ExportWorker::exportCsv(QTextStream& out,
+                             std::shared_ptr<FileSystemNode> node,
+                             int depth)
+{
+    if (isCancelled()) return;
     if (depth > m_opts.maxDepth) return;
 
+    auto csvEsc = [](const QString& s) -> QString {
+        if (s.contains(',') || s.contains('"') || s.contains('\n'))
+            return '"' + QString(s).replace('"', QStringLiteral("\"\"")) + '"';
+        return s;
+    };
+
     if (!node->isDirectory()) {
-        // Escape CSV fields
-        auto csvField = [](const QString& s) -> QString {
-            if (s.contains(',') || s.contains('"') || s.contains('\n')) {
-                return "\"" + QString(s).replace("\"", "\"\"") + "\"";
-            }
-            return s;
-        };
+        out << csvEsc(node->getName())     << ","
+            << csvEsc(node->getPath())     << ","
+            << node->getSize()             << ","
+            << csvEsc(formatBytes(node->getSize())) << ","
+            << csvEsc(node->getExtension()) << ","
+            << csvEsc(node->getCategory());
 
-        out << csvField(node->getName()) << ","
-            << csvField(node->getPath()) << ","
-            << node->getSize() << ","
-            << csvField(formatBytes(node->getSize())) << ","
-            << csvField(node->getExtension()) << ","
-            << csvField(node->getCategory());
-
-        if (m_opts.includeModifiedDate) {
-            out << "," << csvField(node->getLastModified().toString("yyyy-MM-dd HH:mm:ss"));
-        }
-        if (m_opts.includeCreatedDate) {
-            // Qt port doesn't track creation date natively in this model, fallback to modified or empty
-            out << "," << csvField(node->getLastModified().toString("yyyy-MM-dd HH:mm:ss"));
-        }
-        if (m_opts.includeOwner) {
-            out << "," << csvField(""); // Owner tracking not in Qt port
-        }
-        out << "\n";
-        m_itemsWritten++;
-
-        if (m_itemsWritten % 1000 == 0) {
-            emit progressUpdated(m_itemsWritten, node->getName());
-        }
-    }
-
-    if (node->isDirectory()) {
-        for (auto& child : node->getChildren()) {
-            exportCsv(out, child, depth + 1);
-        }
-    }
-}
-
-// ─── ExportService ───────────────────────────────────────────────
-
-ExportService::ExportService(QObject* parent) : QObject(parent) {}
-
-ExportService::~ExportService() {
-    cancelExport();
-}
-
-void ExportService::startExport(std::shared_ptr<FileSystemNode> root,
-                                const QString& outputPath,
-                                const ExportOptions& opts) {
-    cancelExport();
-
-    m_worker = new ExportWorker(root, outputPath, opts);
-    connect(m_worker, &ExportWorker::progressUpdated, this, &ExportService::progressUpdated);
-    connect(m_worker, &ExportWorker::exportFinished, this, &ExportService::exportFinished);
-    connect(m_worker, &ExportWorker::finished, m_worker, &QObject::deleteLater);
-    connect(m_worker, &ExportWorker::finished, this, [this]() { m_worker = nullptr; });
-    m_worker->start();
-}
-
-void ExportService::cancelExport() {
-    if (m_worker && m_worker->isRunning()) {
-        m_worker->cancel();
-        m_worker->wait(5000);
-    }
-}
-
-bool ExportService::isExporting() const {
-    return m_worker && m_worker->isRunning();
-}
+        if (m_opts.includeModifiedDate)
+            out << "," << csvEsc(node->getLastModified

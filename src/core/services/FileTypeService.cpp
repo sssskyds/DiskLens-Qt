@@ -1,4 +1,5 @@
 #include "FileTypeService.h"
+#include "core/utils/CategoryMapper.h"
 #include <algorithm>
 
 FileTypeService::FileTypeService(QObject* parent)
@@ -6,7 +7,9 @@ FileTypeService::FileTypeService(QObject* parent)
 {
 }
 
-QVector<CategoryStat> FileTypeService::analyzeFileTypes(std::shared_ptr<FileSystemNode> root) {
+QVector<CategoryStat> FileTypeService::analyzeFileTypes(
+    std::shared_ptr<FileSystemNode> root)
+{
     QVector<CategoryStat> stats;
     if (!root) return stats;
 
@@ -14,104 +17,86 @@ QVector<CategoryStat> FileTypeService::analyzeFileTypes(std::shared_ptr<FileSyst
     QHash<QString, qint64> catCounts;
     QHash<QString, QHash<QString, ExtensionStat>> extDetails;
 
-    // Start aggregation
     aggregateNode(root, catSizes, catCounts, extDetails);
 
-    qint64 grandTotalSize = root->getSize();
+    const qint64 grandTotal = root->getSize(); // correct after computeSizes pass
 
-    // Standard Category Colors from Design Tokens
-    QHash<QString, QString> catColors = {
-        {"Images", "#00d4ff"},       // Cyan
-        {"Videos", "#8b5cf6"},       // Purple
-        {"Audio", "#ec4899"},        // Pink
-        {"Documents", "#eab308"},    // Yellow
-        {"Code", "#10b981"},         // Emerald
-        {"Archives", "#f97316"},     // Orange
-        {"Executables", "#ef4444"},  // Red
-        {"Fonts", "#14b8a6"},        // Teal
-        {"Data", "#3b82f6"},         // Blue
-        {"Other", "#64748b"}         // Slate
+    static const QHash<QString, QString> catColors = {
+        {"Images",      "#00d4ff"},
+        {"Videos",      "#8b5cf6"},
+        {"Audio",       "#ec4899"},
+        {"Documents",   "#eab308"},
+        {"Code",        "#10b981"},
+        {"Archives",    "#f97316"},
+        {"Executables", "#ef4444"},
+        {"Fonts",       "#14b8a6"},
+        {"Data",        "#3b82f6"},
+        {"Other",       "#64748b"}
     };
 
-    QStringList allCategories = {
-        "Images", "Videos", "Audio", "Documents", "Code", 
-        "Archives", "Executables", "Fonts", "Data", "Other"
+    static const QStringList order = {
+        "Images","Videos","Audio","Documents","Code",
+        "Archives","Executables","Fonts","Data","Other"
     };
 
-    for (const QString& cat : allCategories) {
-        qint64 size = catSizes.value(cat, 0);
-        qint64 count = catCounts.value(cat, 0);
+    for (const QString& cat : order) {
+        const qint64 count = catCounts.value(cat, 0);
+        if (count == 0) continue;
 
-        if (count == 0) continue; // Skip empty categories
+        CategoryStat cs;
+        cs.categoryName = cat;
+        cs.totalSize    = catSizes.value(cat, 0);
+        cs.fileCount    = count;
+        cs.color        = catColors.value(cat, "#64748b");
+        cs.percentage   = grandTotal > 0
+                              ? (static_cast<double>(cs.totalSize) / grandTotal) * 100.0
+                              : 0.0;
 
-        CategoryStat catStat;
-        catStat.categoryName = cat;
-        catStat.totalSize = size;
-        catStat.fileCount = count;
-        catStat.color = catColors.value(cat, "#64748b");
-        
-        if (grandTotalSize > 0) {
-            catStat.percentage = (static_cast<double>(size) / grandTotalSize) * 100.0;
-        } else {
-            catStat.percentage = 0.0;
-        }
-
-        // Add extensions sorted by size descending
-        auto extHash = extDetails.value(cat);
-        for (const auto& val : extHash) {
-            catStat.extensionDetails.push_back(val);
-        }
-
-        std::sort(catStat.extensionDetails.begin(), catStat.extensionDetails.end(), 
+        const auto& exts = extDetails.value(cat);
+        cs.extensionDetails.reserve(exts.size());
+        for (const auto& v : exts) cs.extensionDetails.push_back(v);
+        std::sort(cs.extensionDetails.begin(), cs.extensionDetails.end(),
                   [](const ExtensionStat& a, const ExtensionStat& b) {
                       return a.size > b.size;
                   });
-
-        stats.push_back(catStat);
+        stats.push_back(cs);
     }
 
-    // Sort categories by size descending
     std::sort(stats.begin(), stats.end(), [](const CategoryStat& a, const CategoryStat& b) {
         return a.totalSize > b.totalSize;
     });
-
     return stats;
 }
 
-void FileTypeService::aggregateNode(std::shared_ptr<FileSystemNode> node, 
-                                   QHash<QString, qint64>& catSizes, 
-                                   QHash<QString, qint64>& catCounts,
-                                   QHash<QString, QHash<QString, ExtensionStat>>& extDetails) 
+void FileTypeService::aggregateNode(
+    std::shared_ptr<FileSystemNode> node,
+    QHash<QString, qint64>& catSizes,
+    QHash<QString, qint64>& catCounts,
+    QHash<QString, QHash<QString, ExtensionStat>>& extDetails)
 {
     if (!node) return;
 
     if (!node->isDirectory()) {
-        QString cat = node->getCategory();
-        if (cat.isEmpty()) {
-            cat = "Other";
-        }
-        qint64 size = node->getSize();
-        QString ext = node->getExtension();
-        if (ext.isEmpty()) {
-            ext = "no extension";
-        }
+        // Use CategoryMapper so the classification is always consistent with
+        // ScanWorker and SearchWorker — no divergence.
+        const QString cat = CategoryMapper::classify(node->getExtension());
+        const qint64  sz  = node->getSize();
 
-        catSizes[cat] += size;
-        catCounts[cat]++;
+        QString ext = node->getExtension();
+        if (ext.startsWith('.')) ext = ext.mid(1); // normalise: remove leading dot
+        if (ext.isEmpty()) ext = QStringLiteral("(no extension)");
+
+        catSizes[cat]  += sz;
+        catCounts[cat] += 1;
 
         auto& catExts = extDetails[cat];
         if (!catExts.contains(ext)) {
-            ExtensionStat est;
-            est.ext = ext;
-            est.size = 0;
-            est.count = 0;
-            catExts[ext] = est;
+            catExts[ext] = ExtensionStat{ext, 0, 0};
         }
-        catExts[ext].size += size;
-        catExts[ext].count++;
+        catExts[ext].size  += sz;
+        catExts[ext].count += 1;
     } else {
-        for (const auto& child : node->getChildren()) {
+        for (const auto& child : node->getChildren())
             aggregateNode(child, catSizes, catCounts, extDetails);
-        }
     }
 }

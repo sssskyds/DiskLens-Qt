@@ -5,6 +5,8 @@
 #include <QDebug>
 #include <algorithm>
 
+// ─── DuplicateWorker ─────────────────────────────────────────────
+
 DuplicateWorker::DuplicateWorker(std::shared_ptr<FileSystemNode> root, QObject* parent)
     : QThread(parent), m_root(root)
 {
@@ -22,154 +24,161 @@ bool DuplicateWorker::isCancelled() {
 
 void DuplicateWorker::run() {
     m_duplicates.clear();
-    m_wastedSpace = 0;
+    m_wastedSpace     = 0;
     m_cancelRequested = false;
 
-    if (!m_root) {
-        emit searchFinished(false);
-        return;
-    }
+    if (!m_root) { emit searchFinished(false); return; }
 
-    // Step 1: Collect all files
+    // ── Stage 1: collect all file nodes ──────────────────────────
     QVector<std::shared_ptr<FileSystemNode>> allFiles;
     collectAllFiles(m_root, allFiles);
+    if (isCancelled()) { emit searchFinished(false); return; }
 
-    if (isCancelled()) {
-        emit searchFinished(false);
-        return;
-    }
-
-    // Step 2: Group by size
+    // ── Stage 2: group by exact file size (O(1) per file) ────────
     QHash<qint64, QVector<QString>> sizeGroups;
     for (const auto& node : allFiles) {
-        sizeGroups[node->getSize()].push_back(node->getPath());
+        if (node->getSize() > 0)          // ignore empty files
+            sizeGroups[node->getSize()].push_back(node->getPath());
     }
 
-    // Filter sizes that have more than 1 file
-    QVector<qint64> candidateSizes;
-    int totalCandidates = 0;
+    // Keep only sizes with multiple candidates
+    QVector<QPair<qint64, QVector<QString>>> candidates;
+    candidates.reserve(sizeGroups.size());
     for (auto it = sizeGroups.begin(); it != sizeGroups.end(); ++it) {
-        if (it.value().size() > 1 && it.key() > 0) {
-            candidateSizes.push_back(it.key());
-            totalCandidates += it.value().size();
+        if (it.value().size() > 1)
+            candidates.append({it.key(), it.value()});
+    }
+    if (candidates.isEmpty()) { emit searchFinished(true); return; }
+
+    // Sort largest first so wasted-space estimates stay meaningful during scan
+    std::sort(candidates.begin(), candidates.end(),
+              [](const auto& a, const auto& b){ return a.first > b.first; });
+
+    int totalCandidates = 0;
+    for (const auto& p : candidates) totalCandidates += p.second.size();
+    int processed = 0;
+
+    // ── Stage 3a: quick partial-hash pre-filter ───────────────────
+    // Groups surviving this stage are still CANDIDATES, not confirmed dupes.
+    QVector<QPair<qint64, QVector<QString>>> quickMatches;
+    for (const auto& [size, paths] : candidates) {
+        if (isCancelled()) { emit searchFinished(false); return; }
+
+        QHash<QString, QVector<QString>> quickGroups;
+        for (const QString& p : paths) {
+            if (isCancelled()) { emit searchFinished(false); return; }
+            const QString h = computePartialHash(p, size);
+            if (!h.isEmpty()) quickGroups[h].push_back(p);
+            processed++;
+            if (processed % 10 == 0)
+                emit progressUpdated(p, processed, totalCandidates * 2);
+        }
+        for (auto it = quickGroups.begin(); it != quickGroups.end(); ++it) {
+            if (it.value().size() > 1)
+                quickMatches.append({size, it.value()});
         }
     }
+    if (quickMatches.isEmpty()) { emit searchFinished(true); return; }
 
-    if (isCancelled() || candidateSizes.isEmpty()) {
-        emit searchFinished(true);
-        return;
-    }
+    // ── Stage 3b: full SHA-256 confirmation ───────────────────────
+    // Only files that survived the partial-hash filter are fully hashed.
+    // This is the ONLY stage that produces confirmed duplicate groups.
+    int fullTotal = 0;
+    for (const auto& p : quickMatches) fullTotal += p.second.size();
+    int fullProcessed = 0;
 
-    // Step 3: Hash files with identical sizes
-    QHash<QString, QVector<QString>> checksumGroups;
-    int processedCount = 0;
+    for (const auto& [size, paths] : quickMatches) {
+        if (isCancelled()) { emit searchFinished(false); return; }
 
-    for (qint64 size : candidateSizes) {
-        if (isCancelled()) break;
-
-        const auto& paths = sizeGroups[size];
-        QHash<QString, QVector<QString>> localHashGroups;
-
-        for (const QString& path : paths) {
-            if (isCancelled()) break;
-
-            processedCount++;
-            if (processedCount % 5 == 0) {
-                emit progressUpdated(path, processedCount, totalCandidates);
-            }
-
-            QString hash = calculateChecksum(path, size);
-            if (!hash.isEmpty()) {
-                localHashGroups[hash].push_back(path);
-            }
+        QHash<QString, QVector<QString>> fullGroups;
+        for (const QString& p : paths) {
+            if (isCancelled()) { emit searchFinished(false); return; }
+            const QString h = computeFullHash(p);
+            if (!h.isEmpty()) fullGroups[h].push_back(p);
+            fullProcessed++;
+            emit progressUpdated(p,
+                                 totalCandidates + fullProcessed,
+                                 totalCandidates * 2);
         }
-
-        // Add matching groups to global duplicates
-        for (auto it = localHashGroups.begin(); it != localHashGroups.end(); ++it) {
+        for (auto it = fullGroups.begin(); it != fullGroups.end(); ++it) {
             if (it.value().size() > 1) {
                 DuplicateGroup group;
-                group.fileSize = size;
-                group.checksum = it.key();
+                group.fileSize  = size;
+                group.fullHash  = it.key();
                 group.filePaths = it.value();
                 m_duplicates.push_back(group);
-
-                // Wasted space is size * (count - 1)
-                m_wastedSpace += size * (it.value().size() - 1);
+                m_wastedSpace += size * static_cast<qint64>(it.value().size() - 1);
             }
         }
     }
 
-    // Sort duplicates by size descending
-    std::sort(m_duplicates.begin(), m_duplicates.end(), [](const DuplicateGroup& a, const DuplicateGroup& b) {
-        return a.fileSize > b.fileSize;
-    });
+    // Sort by wasted space descending for best UX
+    std::sort(m_duplicates.begin(), m_duplicates.end(),
+              [](const DuplicateGroup& a, const DuplicateGroup& b) {
+                  return (a.fileSize * (a.filePaths.size()-1))
+                       > (b.fileSize * (b.filePaths.size()-1));
+              });
 
-    if (isCancelled()) {
-        emit searchFinished(false);
-    } else {
-        emit searchFinished(true);
-    }
+    emit searchFinished(true);
 }
 
-void DuplicateWorker::collectAllFiles(std::shared_ptr<FileSystemNode> node, QVector<std::shared_ptr<FileSystemNode>>& fileList) {
+void DuplicateWorker::collectAllFiles(
+    std::shared_ptr<FileSystemNode> node,
+    QVector<std::shared_ptr<FileSystemNode>>& fileList)
+{
     if (!node || isCancelled()) return;
-
     if (!node->isDirectory()) {
         fileList.push_back(node);
     } else {
-        for (const auto& child : node->getChildren()) {
+        for (const auto& child : node->getChildren())
             collectAllFiles(child, fileList);
-        }
     }
 }
 
-QString DuplicateWorker::calculateChecksum(const QString& filePath, qint64 size) {
+QString DuplicateWorker::computePartialHash(const QString& filePath, qint64 size) {
     QFile file(filePath);
-    if (!file.open(QIODevice::ReadOnly)) {
-        return "";
-    }
+    if (!file.open(QIODevice::ReadOnly)) return {};
 
-    QCryptographicHash hash(QCryptographicHash::Md5);
-    
-    // Partial hashing optimization for large files (> 100MB)
-    const qint64 HUNDRED_MB = 100LL * 1024 * 1024;
-    const qint64 CHUNK_SIZE = 8 * 1024; // 8KB
+    QCryptographicHash hash(QCryptographicHash::Sha256);
 
-    if (size > HUNDRED_MB) {
-        // Read first chunk
-        QByteArray buffer = file.read(CHUNK_SIZE);
-        hash.addData(buffer);
-
-        // Read middle chunk
-        if (file.seek(size / 2)) {
-            buffer = file.read(CHUNK_SIZE);
-            hash.addData(buffer);
-        }
-
-        // Read last chunk
-        if (file.seek(size - CHUNK_SIZE)) {
-            buffer = file.read(CHUNK_SIZE);
-            hash.addData(buffer);
-        }
-        
-        // Append size to salt the partial hash
+    if (size > PARTIAL_THRESH) {
+        // Sample: first chunk, middle chunk, last chunk
+        auto readChunk = [&](qint64 offset) {
+            if (file.seek(offset)) {
+                const QByteArray buf = file.read(CHUNK_SIZE);
+                if (!buf.isEmpty()) hash.addData(buf);
+            }
+        };
+        readChunk(0);
+        readChunk(size / 2);
+        readChunk(qMax(0LL, size - CHUNK_SIZE));
+        // Salt with file size so two files of different sizes never share a hash
         hash.addData(QByteArray::number(size));
     } else {
-        // Full file hashing for smaller files
-        char buffer[16384];
+        // Small files: hash fully (cheap enough)
+        char buf[16384];
         while (!file.atEnd() && !isCancelled()) {
-            qint64 bytesRead = file.read(buffer, sizeof(buffer));
-            if (bytesRead > 0) {
-                hash.addData(QByteArrayView(buffer, bytesRead));
-            }
+            const qint64 n = file.read(buf, sizeof(buf));
+            if (n > 0) hash.addData(QByteArrayView(buf, n));
         }
     }
-
-    file.close();
     return hash.result().toHex();
 }
 
-// --- DuplicateService Implementation ---
+QString DuplicateWorker::computeFullHash(const QString& filePath) {
+    QFile file(filePath);
+    if (!file.open(QIODevice::ReadOnly)) return {};
+
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    char buf[65536];
+    while (!file.atEnd() && !isCancelled()) {
+        const qint64 n = file.read(buf, sizeof(buf));
+        if (n > 0) hash.addData(QByteArrayView(buf, n));
+    }
+    return isCancelled() ? QString{} : hash.result().toHex();
+}
+
+// ─── DuplicateService ────────────────────────────────────────────
 
 DuplicateService::DuplicateService(QObject* parent)
     : QObject(parent)
@@ -182,32 +191,32 @@ DuplicateService::~DuplicateService() {
 
 void DuplicateService::startSearch(std::shared_ptr<FileSystemNode> root) {
     cancelSearch();
+    m_cachedDuplicates.clear();
+    m_cachedWastedSpace = 0;
 
-    m_worker = new DuplicateWorker(root, this);
-    connect(m_worker, &DuplicateWorker::progressUpdated, this, &DuplicateService::progressReported);
-    connect(m_worker, &DuplicateWorker::searchFinished, this, &DuplicateService::searchCompleted);
-    connect(m_worker, &DuplicateWorker::finished, this, &DuplicateService::onWorkerFinished);
-
-    m_worker->start();
+    auto* worker = new DuplicateWorker(root);
+    m_worker = worker;
+    connect(worker, &DuplicateWorker::progressUpdated, this, &DuplicateService::progressReported);
+    connect(worker, &DuplicateWorker::searchFinished,  this, &DuplicateService::onWorkerFinished);
+    connect(worker, &DuplicateWorker::finished, worker, &QObject::deleteLater);
+    worker->start();
 }
 
 void DuplicateService::cancelSearch() {
-    if (m_worker) {
+    if (!m_worker.isNull() && m_worker->isRunning()) {
         m_worker->cancel();
-        m_worker->wait();
-        delete m_worker;
-        m_worker = nullptr;
+        m_worker->wait(8000);
     }
 }
 
-QVector<DuplicateGroup> DuplicateService::getDuplicates() const {
-    return m_worker ? m_worker->getResult() : QVector<DuplicateGroup>();
+bool DuplicateService::isSearching() const {
+    return !m_worker.isNull() && m_worker->isRunning();
 }
 
-qint64 DuplicateService::getWastedSpace() const {
-    return m_worker ? m_worker->getWastedSpace() : 0;
-}
-
-void DuplicateService::onWorkerFinished() {
-    // Worker completed
+void DuplicateService::onWorkerFinished(bool success) {
+    if (!m_worker.isNull()) {
+        m_cachedDuplicates  = m_worker->getResult();
+        m_cachedWastedSpace = m_worker->getWastedSpace();
+    }
+    emit searchCompleted(success);
 }
