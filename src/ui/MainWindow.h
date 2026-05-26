@@ -19,6 +19,7 @@
 #include <QButtonGroup>
 #include <QLabel>
 #include <QProgressBar>
+#include <QLineEdit>
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -32,6 +33,10 @@ protected:
 private slots:
     void onSidebarButtonClicked(int id);
     void onDriveScanRequested(const QString& drivePath);
+
+    // Global directory toolbar
+    void onBrowseDirectory();
+    void onGlobalScanClicked();
 
     // Scan Progress callbacks
     void onScanProgress(const QString& currentPath, qint64 filesScanned, qint64 bytesScanned);
@@ -71,6 +76,12 @@ private:
 
     // Network drive banner
     QFrame* m_networkBanner = nullptr;
+
+    // Global directory toolbar (always visible)
+    QFrame* m_dirToolbar = nullptr;
+    QLineEdit* m_pathInput = nullptr;
+    QPushButton* m_browseBtn = nullptr;
+    QPushButton* m_globalScanBtn = nullptr;
 
     // Global scanning overlay/indicator
     QFrame* m_scanStatusBar = nullptr;
