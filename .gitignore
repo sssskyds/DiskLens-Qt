@@ -1,0 +1,14 @@
+build/
+*.user
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.exe
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
