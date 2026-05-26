@@ -43,9 +43,6 @@ void ScanWorker::run() {
     scanDirectory(m_rootPath, m_rootNode, 0);
 
     if (!isCancelled()) {
-        // Post-order pass: compute accurate cumulative sizes for every folder.
-        // This replaces the old incremental addSize() approach which only
-        // updated the immediate parent and produced wrong subtree totals.
         computeSizes(m_rootNode);
     }
 
@@ -68,7 +65,6 @@ void ScanWorker::scanDirectory(const QString& path,
     for (const QFileInfo& entry : entries) {
         if (isCancelled()) return;
 
-        // Skip symlinks to avoid infinite loops / double-counting
         if (entry.isSymLink()) continue;
 
         const QString name     = entry.fileName();
@@ -98,8 +94,6 @@ void ScanWorker::scanDirectory(const QString& path,
             parentNode->addChild(childNode);
         }
 
-        // Time-based progress: emit every PROGRESS_INTERVAL_MS regardless of
-        // count, so both sparse-deep and flat-shallow trees give responsive UI.
         if (m_progressTimer.elapsed() >= PROGRESS_INTERVAL_MS) {
             emit progressUpdated(fullPath, m_fileCount, m_bytesScanned);
             m_progressTimer.restart();
@@ -107,12 +101,12 @@ void ScanWorker::scanDirectory(const QString& path,
     }
 }
 
-quint64 ScanWorker::computeSizes(std::shared_ptr<FileSystemNode>& node) {
+quint64 ScanWorker::computeSizes(const std::shared_ptr<FileSystemNode>& node) {
     if (!node->isDirectory()) {
         return static_cast<quint64>(node->getSize());
     }
     quint64 total = 0;
-    for (auto& child : node->getChildren()) {
+    for (const auto& child : node->getChildren()) {
         total += computeSizes(child);
     }
     node->setSize(static_cast<qint64>(total));
@@ -153,8 +147,6 @@ void ScanService::cancelScan() {
 
 void ScanService::onWorkerFinished(bool success) {
     if (m_worker) {
-        // Cache results BEFORE deleting the worker so getScanResult() is
-        // always safe to call after scanCompleted fires.
         m_cachedResult      = m_worker->getResult();
         m_cachedFileCount   = m_worker->getFileCount();
         m_cachedFolderCount = m_worker->getFolderCount();
