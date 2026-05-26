@@ -1,0 +1,55 @@
+name: Build DiskLens (Windows)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-windows:
+    runs-on: windows-2025
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.7.0'
+          host: 'windows'
+          target: 'desktop'
+          arch: 'win64_msvc2019_64'
+          cache: true
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -S . `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Deploy Qt dependencies
+        run: |
+          mkdir deploy
+          copy build\Release\DiskLens.exe deploy\DiskLens.exe
+          $qtBin = "$env:QT_ROOT_DIR\bin"
+          & "$qtBin\windeployqt.exe" `
+            --release `
+            --no-translations `
+            --no-system-d3d-compiler `
+            deploy\DiskLens.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DiskLens-Windows
+          path: deploy/
