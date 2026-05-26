@@ -22,31 +22,37 @@ jobs:
           host: 'windows'
           target: 'desktop'
           arch: 'win64_msvc2019_64'
-          modules: ''
           cache: true
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
       - name: Configure CMake (Release)
         run: |
           cmake -B build -S . `
             -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_PREFIX_PATH="$env:Qt6_DIR"
+            -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR"
 
       - name: Build
         run: cmake --build build --config Release --parallel
 
       - name: Prepare deployment folder
         run: |
-          mkdir deploy
-          copy build\Release\DiskLens.exe deploy\DiskLens.exe
+          New-Item -ItemType Directory -Force -Path deploy
+          Copy-Item "build\Release\DiskLens.exe" "deploy\DiskLens.exe"
 
       - name: Run windeployqt
         run: |
-          $qtBin = "$env:Qt6_DIR\bin"
+          $qtBin = "$env:QT_ROOT_DIR\bin"
+          Write-Host "Qt bin path: $qtBin"
+          Write-Host "windeployqt path: $qtBin\windeployqt.exe"
           & "$qtBin\windeployqt.exe" `
             --release `
             --no-translations `
             --no-system-d3d-compiler `
-            deploy\DiskLens.exe
+            "deploy\DiskLens.exe"
 
       - name: Upload artifact (deployed folder)
         uses: actions/upload-artifact@v4
