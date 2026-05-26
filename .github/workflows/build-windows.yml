@@ -1,0 +1,56 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.7.0'
+          host: 'windows'
+          target: 'desktop'
+          arch: 'win64_msvc2019_64'
+          modules: ''
+          cache: true
+
+      - name: Configure CMake (Release)
+        run: |
+          cmake -B build -S . `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_PREFIX_PATH="$env:Qt6_DIR"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Prepare deployment folder
+        run: |
+          mkdir deploy
+          copy build\Release\DiskLens.exe deploy\DiskLens.exe
+
+      - name: Run windeployqt
+        run: |
+          $qtBin = "$env:Qt6_DIR\bin"
+          & "$qtBin\windeployqt.exe" `
+            --release `
+            --no-translations `
+            --no-system-d3d-compiler `
+            deploy\DiskLens.exe
+
+      - name: Upload artifact (deployed folder)
+        uses: actions/upload-artifact@v4
+        with:
+          name: DiskLens-Windows-x64
+          path: deploy/
+          retention-days: 30
